@@ -1,7 +1,9 @@
 """
 Kirim-chiqim hisobini yurituvchi Telegram bot.
-Ishga tushirish: python3 bot.py
-Token BOT_TOKEN muhit o'zgaruvchisidan yoki config.py fayldan olinadi.
+Barcha ma'lumotlar Google Sheets jadvalida saqlanadi (lokal baza ishlatilmaydi).
+
+Ishga tushirish: python bot.py
+Sozlamalar config.py faylidan yoki muhit o'zgaruvchilaridan olinadi.
 """
 import asyncio
 import logging
@@ -15,14 +17,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-import database as db
 import sheets
 
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +46,10 @@ BTN_BALANCE = "💰 Balans"
 BTN_HISTORY = "📜 Tarix"
 BTN_UNDO = "🗑 Oxirgisini o'chirish"
 BTN_CANCEL = "❌ Bekor qilish"
+
+SHEETS_ERROR_TEXT = (
+    "⚠️ Hozircha jadval bilan bog'lanib bo'lmadi. Biroz kutib, qayta urinib ko'ring."
+)
 
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
@@ -109,9 +109,8 @@ def format_history(records: list) -> str:
     lines = ["📜 <b>Oxirgi yozuvlar</b>\n"]
     for r in records:
         sign = "➕" if r["type"] == "income" else "➖"
-        date = r["created_at"].replace("T", " ")[:16]
         note = f" — {r['note']}" if r["note"] else ""
-        lines.append(f"{sign} {format_money(r['amount'])} so'm{note}  <i>({date})</i>")
+        lines.append(f"{sign} {format_money(r['amount'])} so'm{note}  <i>({r['created_at']})</i>")
     return "\n".join(lines)
 
 
@@ -185,39 +184,65 @@ async def process_amount(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     tx_type = data["tx_type"]
 
-    db.add_transaction(message.from_user.id, tx_type, amount, note)
-    sheets.append_transaction(message.from_user.full_name, tx_type, amount, note)
-    await state.clear()
+    try:
+        await asyncio.to_thread(
+            sheets.add_transaction,
+            message.from_user.id,
+            message.from_user.full_name,
+            tx_type,
+            amount,
+            note,
+        )
+    except sheets.SheetsError as exc:
+        logger.warning(f"Jadvalga yozib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    finally:
+        await state.clear()
 
     label = "Kirim" if tx_type == "income" else "Chiqim"
     icon = "➕" if tx_type == "income" else "➖"
     note_text = f" ({note})" if note else ""
-    sheet_note = "" if sheets.is_enabled() else "\n\n⚠️ Google Sheets ulanmagan, faqat botda saqlandi."
     await message.answer(
-        f"{icon} {label} qo'shildi: {format_money(amount)} so'm{note_text}{sheet_note}",
+        f"{icon} {label} qo'shildi: {format_money(amount)} so'm{note_text}",
         reply_markup=main_menu,
     )
 
 
 @dp.message(F.text == BTN_BALANCE)
 async def show_balance(message: Message) -> None:
-    bal = db.get_balance(message.from_user.id)
+    try:
+        bal = await asyncio.to_thread(sheets.get_balance, message.from_user.id)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Balansni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
     await message.answer(format_balance(bal), reply_markup=main_menu)
 
 
 @dp.message(F.text == BTN_HISTORY)
 async def show_history(message: Message) -> None:
-    records = db.get_history(message.from_user.id, limit=10)
+    try:
+        records = await asyncio.to_thread(sheets.get_history, message.from_user.id, 10)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Tarixni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
     await message.answer(format_history(records), reply_markup=main_menu)
 
 
 @dp.message(F.text == BTN_UNDO)
 async def undo_last(message: Message) -> None:
-    deleted = db.delete_last(message.from_user.id)
+    try:
+        deleted = await asyncio.to_thread(sheets.delete_last, message.from_user.id)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Yozuvni o'chirib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+
     if deleted is None:
         await message.answer("O'chiriladigan yozuv topilmadi.", reply_markup=main_menu)
         return
-    sheets.delete_last_row_for_user()
     label = "Kirim" if deleted["type"] == "income" else "Chiqim"
     await message.answer(
         f"O'chirildi: {label} — {format_money(deleted['amount'])} so'm",
@@ -232,8 +257,12 @@ async def main() -> None:
             "config.py faylida BOT_TOKEN = '...' ko'rinishida bering."
         )
 
-    db.init_db()
-    sheets.init_sheets(GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON)
+    if not sheets.init_sheets(GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON):
+        raise SystemExit(
+            "Google Sheets bilan ulanib bo'lmadi. GOOGLE_SHEET_ID va kalit sozlamalarini tekshiring "
+            "(yuqoridagi xato xabariga qarang)."
+        )
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
