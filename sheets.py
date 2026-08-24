@@ -3,12 +3,15 @@ Google Sheets — botning yagona ma'lumotlar ombori.
 
 Tuzilishi:
 - Har bir foydalanuvchi uchun ALOHIDA list (tab), nomi foydalanuvchi ismi bilan.
-  Ustunlari: Sana | Hisob | Turi | Summa | Izoh
+  Ustunlari: Sana | Hisob | Turi | Summa | Izoh | Usta
 - "_Users"    — xizmat listi: User ID | Ism | List nomi
-- "_Hisoblar" — xizmat listi: User ID | Hisob | Valyuta  (har kimning hisoblari)
+- "_Hisoblar" — xizmat listi: User ID | Hisob | Valyuta
+- "_Ustalar"  — xizmat listi: User ID | Hisob | Usta | Kelishilgan | Izoh
 
 Har bir foydalanuvchining bir nechta hisobi bo'lishi mumkin (masalan "Imzo showroom"
-va "Shaxsiy"), ular bir-biriga umuman aralashmaydi.
+va "Shaxsiy"), ular bir-biriga umuman aralashmaydi. Har bir hisob ichida ustalar
+bo'yicha kelishuv yuritiladi: to'lov oddiy CHIQIM sifatida yoziladi (ya'ni hisob
+balansidan ayriladi) va "Usta" ustuni orqali kimga berilgani belgilanadi.
 """
 import json
 import logging
@@ -18,8 +21,9 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-USER_HEADERS = ["Sana", "Hisob", "Turi", "Summa", "Izoh"]
-COL_DATE, COL_ACCOUNT, COL_TYPE, COL_AMOUNT, COL_NOTE = 0, 1, 2, 3, 4
+USER_HEADERS = ["Sana", "Hisob", "Turi", "Summa", "Izoh", "Usta"]
+USER_HEADERS_LEGACY = ["Sana", "Hisob", "Turi", "Summa", "Izoh"]   # "Usta" ustunisiz eski format
+COL_DATE, COL_ACCOUNT, COL_TYPE, COL_AMOUNT, COL_NOTE, COL_MASTER = 0, 1, 2, 3, 4, 5
 
 USERS_SHEET = "_Users"
 USERS_HEADERS = ["User ID", "Ism", "List nomi"]
@@ -27,6 +31,9 @@ USERS_HEADERS = ["User ID", "Ism", "List nomi"]
 ACCOUNTS_SHEET = "_Hisoblar"
 ACCOUNTS_HEADERS = ["User ID", "Hisob", "Valyuta"]
 ACCOUNTS_HEADERS_LEGACY = ["User ID", "Hisob"]      # eski format (valyutasiz)
+
+MASTERS_SHEET = "_Ustalar"
+MASTERS_HEADERS = ["User ID", "Hisob", "Usta", "Kelishilgan", "Izoh"]
 
 DEFAULT_CURRENCY = "so'm"
 CURRENCIES = ["so'm", "$"]
@@ -45,6 +52,7 @@ _enabled = False
 _lock = threading.RLock()          # bir vaqtda bir nechta so'rov kelishi mumkin
 _user_ws_cache: dict[int, object] = {}
 _accounts_cache: dict[int, list] = {}
+_masters_cache: dict[tuple, list] = {}      # (user_id, hisob) -> [(usta, kelishilgan)]
 
 
 class SheetsError(Exception):
@@ -109,6 +117,7 @@ def init_sheets(credentials_file: str, sheet_id: str, credentials_json: str = ""
         _spreadsheet = spreadsheet
         _ensure_service_sheet(USERS_SHEET, USERS_HEADERS)
         _ensure_service_sheet(ACCOUNTS_SHEET, ACCOUNTS_HEADERS, ACCOUNTS_HEADERS_LEGACY)
+        _ensure_service_sheet(MASTERS_SHEET, MASTERS_HEADERS)
         _enabled = True
         logger.info("Google Sheets bilan ulanish muvaffaqiyatli o'rnatildi.")
         return True
@@ -215,8 +224,14 @@ def get_user_sheet(user_id: int, user_name: str):
                 _register_user(user_id, user_name, title)
                 # Hisoblar get_accounts() ichida bir marta yaratiladi — bu yerda takrorlamaymiz
 
-            if ws.row_values(1) != USER_HEADERS:
-                ws.insert_row(USER_HEADERS, index=1)
+            first = ws.row_values(1)
+            if first != USER_HEADERS:
+                if first == USER_HEADERS_LEGACY:
+                    # Faqat oxiriga ustun qo'shamiz — mavjud qatorlar joyida qoladi
+                    ws.update_cell(1, len(USER_HEADERS), USER_HEADERS[-1])
+                    logger.info(f"«{title}» listiga «Usta» ustuni qo'shildi.")
+                else:
+                    ws.insert_row(USER_HEADERS, index=1)
 
             _apply_amount_format(ws)
             _user_ws_cache[user_id] = ws
@@ -432,7 +447,7 @@ def ensure_can_spend(user_id: int, user_name: str, account: str, amount: float) 
 
 
 def add_transaction(user_id: int, user_name: str, account: str,
-                    tx_type: str, amount: float, note: str = "") -> None:
+                    tx_type: str, amount: float, note: str = "", master: str = "") -> None:
     """Yangi yozuv qo'shadi.
     Chiqim hisobdagi qoldiqdan oshsa, AccountError ko'tariladi — balans hech qachon
     manfiyga (qarzga) tushmaydi."""
@@ -448,7 +463,7 @@ def add_transaction(user_id: int, user_name: str, account: str,
     label = LABEL_INCOME if tx_type == "income" else LABEL_EXPENSE
     date_str = _local_now().strftime("%Y-%m-%d %H:%M")
     try:
-        ws.append_row([date_str, account, label, amount, note])
+        ws.append_row([date_str, account, label, amount, note, master])
     except Exception as exc:  # noqa: BLE001
         raise SheetsError(str(exc)) from exc
 
@@ -496,6 +511,7 @@ def get_history(user_id: int, user_name: str, account: str, limit: int = 10) -> 
             "note": row[COL_NOTE] if len(row) > COL_NOTE else "",
             "created_at": row[COL_DATE],
             "account": row[COL_ACCOUNT],
+            "master": row[COL_MASTER] if len(row) > COL_MASTER else "",
         }
         for _, row in reversed(recent)
     ]
@@ -518,3 +534,145 @@ def delete_last(user_id: int, user_name: str, account: str) -> dict | None:
             "created_at": row[COL_DATE],
             "account": row[COL_ACCOUNT],
         }
+
+
+# --------------------------------------------------------------------------
+# Ustalar (hisob ichidagi kelishuvlar)
+# --------------------------------------------------------------------------
+
+MAX_MASTER_NAME = 50
+
+
+def get_masters(user_id: int, user_name: str, account: str) -> list:
+    """[(usta nomi, kelishilgan summa), ...] — berilgan hisob ichida."""
+    _check_ready()
+    key = (user_id, account.casefold())
+    with _lock:
+        cached = _masters_cache.get(key)
+        if cached is not None:
+            return list(cached)
+        try:
+            ws = _spreadsheet.worksheet(MASTERS_SHEET)
+            rows = ws.get_all_values()[1:]
+        except Exception as exc:  # noqa: BLE001
+            raise SheetsError(str(exc)) from exc
+
+        found, seen = [], set()
+        for row in rows:
+            if len(row) < 4 or row[0].strip() != str(user_id):
+                continue
+            if row[1].strip().casefold() != account.casefold():
+                continue
+            name = row[2].strip()
+            if name and name.casefold() not in seen:
+                seen.add(name.casefold())
+                found.append((name, _parse_amount(row[3])))
+        _masters_cache[key] = found
+        return list(found)
+
+
+def add_master(user_id: int, user_name: str, account: str,
+               name: str, agreed: float, note: str = "") -> str:
+    """Hisob ichiga yangi usta/xizmat qo'shadi (kelishilgan summa bilan)."""
+    _check_ready()
+    clean = " ".join((name or "").split())
+    if not clean:
+        raise AccountError("Usta nomi bo'sh bo'lishi mumkin emas.")
+    if len(clean) > MAX_MASTER_NAME:
+        raise AccountError(f"Nom juda uzun (ko'pi bilan {MAX_MASTER_NAME} ta belgi).")
+    if agreed < 0:
+        raise AccountError("Kelishilgan summa manfiy bo'lishi mumkin emas.")
+
+    with _lock:
+        if any(m.casefold() == clean.casefold() for m, _ in get_masters(user_id, user_name, account)):
+            raise AccountError(f"«{clean}» allaqachon ro'yxatda bor.")
+        try:
+            _spreadsheet.worksheet(MASTERS_SHEET).append_row(
+                [str(user_id), account, clean, agreed, note])
+        except Exception as exc:  # noqa: BLE001
+            raise SheetsError(str(exc)) from exc
+        _masters_cache.pop((user_id, account.casefold()), None)
+        return clean
+
+
+def set_master_agreed(user_id: int, user_name: str, account: str,
+                      name: str, agreed: float) -> None:
+    """Kelishilgan summani o'zgartiradi."""
+    _check_ready()
+    if agreed < 0:
+        raise AccountError("Kelishilgan summa manfiy bo'lishi mumkin emas.")
+    with _lock:
+        match = next((m for m, _ in get_masters(user_id, user_name, account)
+                      if m.casefold() == name.casefold()), None)
+        if match is None:
+            raise AccountError(f"«{name}» topilmadi.")
+        try:
+            ws = _spreadsheet.worksheet(MASTERS_SHEET)
+            for idx, row in enumerate(ws.get_all_values(), start=1):
+                if idx == 1 or len(row) < 3:
+                    continue
+                if (row[0].strip() == str(user_id)
+                        and row[1].strip().casefold() == account.casefold()
+                        and row[2].strip().casefold() == match.casefold()):
+                    ws.update_cell(idx, 4, agreed)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            raise SheetsError(str(exc)) from exc
+        _masters_cache.pop((user_id, account.casefold()), None)
+
+
+def pay_master(user_id: int, user_name: str, account: str,
+               name: str, amount: float, note: str = "") -> None:
+    """Ustaga to'lov — oddiy CHIQIM sifatida yoziladi, ya'ni hisob balansidan ayriladi."""
+    match = next((m for m, _ in get_masters(user_id, user_name, account)
+                  if m.casefold() == name.casefold()), None)
+    if match is None:
+        raise AccountError(f"«{name}» topilmadi.")
+    add_transaction(user_id, user_name, account, "expense", amount, note, master=match)
+    _masters_cache.pop((user_id, account.casefold()), None)
+
+
+def get_master_report(user_id: int, user_name: str, account: str) -> list:
+    """Har bir usta bo'yicha: kelishilgan / berilgan / qolgan."""
+    masters = get_masters(user_id, user_name, account)
+    _, rows = _rows_of(user_id, user_name, account)
+
+    paid: dict[str, float] = {m.casefold(): 0.0 for m, _ in masters}
+    for _, row in rows:
+        if len(row) <= COL_MASTER:
+            continue
+        tag = row[COL_MASTER].strip().casefold()
+        if tag and tag in paid and row[COL_TYPE].strip() == LABEL_EXPENSE:
+            paid[tag] += _parse_amount(row[COL_AMOUNT])
+
+    result = []
+    for m, agreed in masters:
+        p = paid.get(m.casefold(), 0.0)
+        result.append({"name": m, "agreed": agreed, "paid": p, "left": agreed - p})
+    return result
+
+
+def delete_master(user_id: int, user_name: str, account: str, name: str) -> None:
+    """Ustani ro'yxatdan o'chiradi. To'lovi bo'lsa ruxsat berilmaydi."""
+    _check_ready()
+    with _lock:
+        rep = next((r for r in get_master_report(user_id, user_name, account)
+                    if r["name"].casefold() == name.casefold()), None)
+        if rep is None:
+            raise AccountError(f"«{name}» topilmadi.")
+        if rep["paid"] > 0:
+            raise AccountError(
+                f"«{rep['name']}» ga {_fmt(rep['paid'])} to'lov qilingan — o'chirib bo'lmaydi.\n"
+                f"Avval o'sha to'lovlarni jadvaldan o'chiring."
+            )
+        try:
+            ws = _spreadsheet.worksheet(MASTERS_SHEET)
+            targets = [idx for idx, row in enumerate(ws.get_all_values(), start=1)
+                       if idx > 1 and len(row) >= 3 and row[0].strip() == str(user_id)
+                       and row[1].strip().casefold() == account.casefold()
+                       and row[2].strip().casefold() == name.casefold()]
+            for idx in reversed(targets):
+                ws.delete_rows(idx)
+        except Exception as exc:  # noqa: BLE001
+            raise SheetsError(str(exc)) from exc
+        _masters_cache.pop((user_id, account.casefold()), None)

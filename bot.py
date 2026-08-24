@@ -55,10 +55,16 @@ BTN_DEL_ACCOUNT = "🗑 Hisobni o'chirish"
 BTN_BACK = "⬅️ Orqaga"
 BTN_NO_NOTE = "➡️ Izohsiz saqlash"
 BTN_CURRENCY = "💱 Valyutani o'zgartirish"
+BTN_MASTERS = "👷 Ustalar"
+BTN_ADD_MASTER = "➕ Yangi usta"
+BTN_PAY_MASTER = "💵 To'lov berish"
+BTN_MASTER_REPORT = "📋 Ustalar hisoboti"
+BTN_EDIT_AGREED = "✏️ Kelishuvni o'zgartirish"
 
 MENU_WORDS = {
     BTN_INCOME, BTN_EXPENSE, BTN_BALANCE, BTN_HISTORY, BTN_UNDO,
     BTN_ACCOUNTS, BTN_CANCEL, BTN_ADD_ACCOUNT, BTN_DEL_ACCOUNT, BTN_BACK, BTN_NO_NOTE, BTN_CURRENCY,
+    BTN_MASTERS, BTN_ADD_MASTER, BTN_PAY_MASTER, BTN_MASTER_REPORT, BTN_EDIT_AGREED,
 }
 
 SHEETS_ERROR_TEXT = "⚠️ Jadval bilan bog'lanib bo'lmadi. Biroz kutib, qayta urinib ko'ring."
@@ -68,6 +74,7 @@ main_menu = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_INCOME), KeyboardButton(text=BTN_EXPENSE)],
         [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_UNDO), KeyboardButton(text=BTN_ACCOUNTS)],
+        [KeyboardButton(text=BTN_MASTERS)],
     ],
     resize_keyboard=True,
 )
@@ -85,6 +92,15 @@ accounts_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ADD_ACCOUNT), KeyboardButton(text=BTN_DEL_ACCOUNT)],
         [KeyboardButton(text=BTN_CURRENCY)],
+        [KeyboardButton(text=BTN_BACK)],
+    ],
+    resize_keyboard=True,
+)
+
+masters_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_ADD_MASTER), KeyboardButton(text=BTN_PAY_MASTER)],
+        [KeyboardButton(text=BTN_MASTER_REPORT), KeyboardButton(text=BTN_EDIT_AGREED)],
         [KeyboardButton(text=BTN_BACK)],
     ],
     resize_keyboard=True,
@@ -122,6 +138,18 @@ class Flow(StatesGroup):
     choose_new_currency = State()     # yangi hisob uchun valyuta
     choose_account_cur = State()      # valyutasi o'zgartiriladigan hisob
     choose_currency = State()         # yangi valyuta
+    # --- Ustalar ---
+    m_acc_add = State()      # yangi usta uchun hisob
+    m_name = State()         # usta nomi
+    m_agreed = State()       # kelishilgan summa
+    m_acc_pay = State()      # to'lov uchun hisob
+    m_pick_pay = State()     # to'lov qilinadigan usta
+    m_pay_amount = State()   # to'lov summasi
+    m_pay_note = State()     # to'lov izohi
+    m_acc_report = State()   # hisobot uchun hisob
+    m_acc_edit = State()     # kelishuvni o'zgartirish uchun hisob
+    m_pick_edit = State()    # o'zgartiriladigan usta
+    m_new_agreed = State()   # yangi kelishilgan summa
 
 
 AMOUNT_RE = re.compile(r"^[\d\s.,']+$")
@@ -231,7 +259,8 @@ async def cmd_help(message: Message) -> None:
         f"{BTN_BALANCE} — barcha hisoblar bo'yicha balans\n"
         f"{BTN_HISTORY} — tanlangan hisobning so'nggi yozuvlari\n"
         f"{BTN_UNDO} — oxirgi yozuvni bekor qilish\n"
-        f"{BTN_ACCOUNTS} — hisob qo'shish, o'chirish, valyutasini o'zgartirish\n\n"
+        f"{BTN_ACCOUNTS} — hisob qo'shish, o'chirish, valyutasini o'zgartirish\n"
+        f"{BTN_MASTERS} — usta/xizmat kelishuvlari va to'lovlari\n\n"
         "Har bir hisobning o'z valyutasi bor (so'm yoki $) — ular hech qachon "
         "bir-biriga qo'shilmaydi.\n\n"
         "Har bir yozuv qaysi hisobga tegishli ekani so'raladi — hisoblar "
@@ -644,6 +673,382 @@ async def process_delete_account(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer(f"🗑 «{chosen}» hisobi o'chirildi.", reply_markup=main_menu)
+
+
+# ==========================================================================
+# USTALAR — hisob ichidagi kelishuvlar va to'lovlar
+# ==========================================================================
+
+def master_keyboard(masters: list) -> ReplyKeyboardMarkup:
+    rows, buf = [], []
+    for m in masters:
+        buf.append(KeyboardButton(text=m))
+        if len(buf) == 2:
+            rows.append(buf); buf = []
+    if buf:
+        rows.append(buf)
+    rows.append([KeyboardButton(text=BTN_CANCEL)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def format_master_report(account: str, rows: list, cur: str) -> str:
+    if not rows:
+        return (f"«{account}» hisobida hozircha usta yo'q.\n"
+                f"«{BTN_ADD_MASTER}» orqali qo'shing.")
+    lines = [f"👷 <b>{account}</b> — ustalar\n"]
+    t_agreed = t_paid = 0.0
+    for r in rows:
+        t_agreed += r["agreed"]; t_paid += r["paid"]
+        if r["left"] < -0.005:
+            qolgan = f"⚠️ ortiqcha to'langan: {format_money(-r['left'], cur)}"
+        elif r["left"] < 0.005:
+            qolgan = "✅ to'liq to'langan"
+        else:
+            qolgan = f"<b>Qolgan: {format_money(r['left'], cur)}</b>"
+        lines.append(
+            f"\n<b>{r['name']}</b>\n"
+            f"  Kelishilgan: {format_money(r['agreed'], cur)}\n"
+            f"  Berilgan: {format_money(r['paid'], cur)}\n"
+            f"  {qolgan}"
+        )
+    lines.append(
+        f"\n—————————————\n"
+        f"Jami kelishilgan: {format_money(t_agreed, cur)}\n"
+        f"Jami berilgan: {format_money(t_paid, cur)}\n"
+        f"<b>Jami qolgan: {format_money(t_agreed - t_paid, cur)}</b>"
+    )
+    return "\n".join(lines)
+
+
+async def _pick_account(message: Message, state: FSMContext, next_state, question: str) -> None:
+    """Hisob tanlash bosqichini boshlaydi."""
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    await state.set_state(next_state)
+    await message.answer(question, reply_markup=account_keyboard(accounts))
+
+
+async def _resolve_account(message: Message):
+    """Tanlangan hisobni tekshiradi; noto'g'ri bo'lsa None qaytaradi."""
+    accounts = await load_accounts(message)
+    chosen = next((a for a in accounts if a == (message.text or "")), None)
+    if chosen is None:
+        await message.answer("Iltimos, tugmalardan hisobni tanlang.",
+                             reply_markup=account_keyboard(accounts))
+    return chosen
+
+
+@dp.message(StateFilter(None), F.text == BTN_MASTERS)
+async def show_masters_menu(message: Message) -> None:
+    await message.answer(
+        "👷 <b>Ustalar</b>\n\n"
+        "Bu yerda har bir hisob ichida usta va ko'rsatilgan xizmatlar bo'yicha "
+        "kelishilgan summa va berilgan to'lovlar yuritiladi.\n"
+        "Berilgan to'lov hisob balansidan avtomatik ayriladi.",
+        reply_markup=masters_menu,
+    )
+
+
+# --- Yangi usta ---
+
+@dp.message(F.text == BTN_ADD_MASTER)
+async def m_start_add(message: Message, state: FSMContext) -> None:
+    await _pick_account(message, state, Flow.m_acc_add, "Usta qaysi hisobga qo'shilsin?")
+
+
+@dp.message(Flow.m_acc_add)
+async def m_got_account(message: Message, state: FSMContext) -> None:
+    try:
+        chosen = await _resolve_account(message)
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+    if chosen is None:
+        return
+    await state.update_data(m_account=chosen)
+    await state.set_state(Flow.m_name)
+    await message.answer(
+        f"«{chosen}» — usta yoki xizmat nomini yozing\n"
+        f"(masalan: <code>Gipsakarton usta Aziz</code>):",
+        reply_markup=cancel_menu,
+    )
+
+
+@dp.message(Flow.m_name)
+async def m_got_name(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if not name or name in MENU_WORDS:
+        await message.answer("Boshqa nom yozing.")
+        return
+    data = await state.get_data()
+    try:
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+    await state.update_data(m_name=name)
+    await state.set_state(Flow.m_agreed)
+    await message.answer(
+        f"«{name}» bilan kelishilgan summa qancha ({cur})?\n"
+        f"Faqat raqam yozing. Kelishuv hali aniq bo'lmasa <code>0</code> yozing.",
+        reply_markup=cancel_menu,
+    )
+
+
+@dp.message(Flow.m_agreed)
+async def m_got_agreed(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    agreed = 0.0 if raw == "0" else parse_amount(raw)
+    if agreed is None:
+        await message.answer("Faqat raqam yozing. Masalan: <code>5000</code>")
+        return
+    data = await state.get_data()
+    try:
+        created = await asyncio.to_thread(
+            sheets.add_master, message.from_user.id, message.from_user.full_name,
+            data["m_account"], data["m_name"], agreed,
+        )
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+    except sheets.AccountError as exc:
+        await state.set_state(Flow.m_name)
+        await message.answer(f"⚠️ {exc}\n\nBoshqa nom yozing.", reply_markup=cancel_menu)
+        return
+    except sheets.SheetsError as exc:
+        logger.warning(f"Ustani qo'shib bo'lmadi: {exc}")
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{created}</b> qo'shildi.\n"
+        f"Hisob: {data['m_account']} · Kelishilgan: {format_money(agreed, cur)}",
+        reply_markup=main_menu,
+    )
+
+
+# --- To'lov berish ---
+
+@dp.message(F.text == BTN_PAY_MASTER)
+async def m_start_pay(message: Message, state: FSMContext) -> None:
+    await _pick_account(message, state, Flow.m_acc_pay, "To'lov qaysi hisobdan berilsin?")
+
+
+@dp.message(Flow.m_acc_pay)
+async def m_pay_account(message: Message, state: FSMContext) -> None:
+    try:
+        chosen = await _resolve_account(message)
+        if chosen is None:
+            return
+        masters = await asyncio.to_thread(sheets.get_masters, message.from_user.id,
+                                          message.from_user.full_name, chosen)
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    if not masters:
+        await state.clear()
+        await message.answer(f"«{chosen}» hisobida usta yo'q. Avval «{BTN_ADD_MASTER}» qiling.",
+                             reply_markup=masters_menu)
+        return
+    await state.update_data(m_account=chosen)
+    await state.set_state(Flow.m_pick_pay)
+    await message.answer("Kimga to'lov berilyapti?",
+                         reply_markup=master_keyboard([m for m, _ in masters]))
+
+
+@dp.message(Flow.m_pick_pay)
+async def m_pay_pick(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    try:
+        masters = await asyncio.to_thread(sheets.get_masters, message.from_user.id,
+                                          message.from_user.full_name, data["m_account"])
+        names = [m for m, _ in masters]
+        chosen = next((m for m in names if m == (message.text or "")), None)
+        if chosen is None:
+            await message.answer("Iltimos, tugmalardan tanlang.",
+                                 reply_markup=master_keyboard(names))
+            return
+        rep = next(r for r in await asyncio.to_thread(
+            sheets.get_master_report, message.from_user.id,
+            message.from_user.full_name, data["m_account"]) if r["name"] == chosen)
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    await state.update_data(m_name=chosen)
+    await state.set_state(Flow.m_pay_amount)
+    await message.answer(
+        f"<b>{chosen}</b>\n"
+        f"Kelishilgan: {format_money(rep['agreed'], cur)}\n"
+        f"Berilgan: {format_money(rep['paid'], cur)}\n"
+        f"Qolgan: <b>{format_money(rep['left'], cur)}</b>\n\n"
+        f"Qancha to'lov berilyapti? Faqat raqam yozing.",
+        reply_markup=cancel_menu,
+    )
+
+
+@dp.message(Flow.m_pay_amount)
+async def m_pay_amount(message: Message, state: FSMContext) -> None:
+    amount = parse_amount(message.text or "")
+    if amount is None:
+        await message.answer("Faqat summani kiriting. Masalan: <code>500</code>")
+        return
+    data = await state.get_data()
+    try:
+        await asyncio.to_thread(sheets.ensure_can_spend, message.from_user.id,
+                                message.from_user.full_name, data["m_account"], amount)
+    except sheets.AccountError as exc:
+        await message.answer(f"⚠️ {exc}\n\nBoshqa summa kiriting yoki bekor qiling.")
+        return
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    await state.update_data(m_amount=amount)
+    await state.set_state(Flow.m_pay_note)
+    await message.answer("Izoh yozing (masalan: <code>1-bosqich uchun</code>) "
+                         f"yoki «{BTN_NO_NOTE}» bosing.", reply_markup=note_menu)
+
+
+@dp.message(Flow.m_pay_note)
+async def m_pay_note(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    note = "" if text == BTN_NO_NOTE else text[:200]
+    data = await state.get_data()
+    try:
+        await asyncio.to_thread(
+            sheets.pay_master, message.from_user.id, message.from_user.full_name,
+            data["m_account"], data["m_name"], data["m_amount"], note,
+        )
+        rep = next(r for r in await asyncio.to_thread(
+            sheets.get_master_report, message.from_user.id,
+            message.from_user.full_name, data["m_account"]) if r["name"] == data["m_name"])
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+        bal = await asyncio.to_thread(sheets.get_balance, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+    except sheets.AccountError as exc:
+        await state.clear(); await message.answer(f"⚠️ {exc}", reply_markup=main_menu); return
+    except sheets.SheetsError as exc:
+        logger.warning(f"To'lovni yozib bo'lmadi: {exc}")
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    await state.clear()
+    qolgan = ("✅ to'liq to'langan" if abs(rep["left"]) < 0.005 else
+              f"Qolgan: <b>{format_money(rep['left'], cur)}</b>")
+    await message.answer(
+        f"💵 <b>{data['m_name']}</b> ga to'lov berildi: "
+        f"{format_money(data['m_amount'], cur)}\n"
+        f"{qolgan}\n\n"
+        f"«{data['m_account']}» qoldig'i: <b>{format_money(bal['balance'], cur)}</b>",
+        reply_markup=main_menu,
+    )
+
+
+# --- Hisobot ---
+
+@dp.message(F.text == BTN_MASTER_REPORT)
+async def m_start_report(message: Message, state: FSMContext) -> None:
+    await _pick_account(message, state, Flow.m_acc_report, "Qaysi hisob bo'yicha ko'rsatay?")
+
+
+@dp.message(Flow.m_acc_report)
+async def m_report(message: Message, state: FSMContext) -> None:
+    try:
+        chosen = await _resolve_account(message)
+        if chosen is None:
+            return
+        rows = await asyncio.to_thread(sheets.get_master_report, message.from_user.id,
+                                       message.from_user.full_name, chosen)
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, chosen)
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+    await state.clear()
+    await message.answer(format_master_report(chosen, rows, cur), reply_markup=main_menu)
+
+
+# --- Kelishuvni o'zgartirish ---
+
+@dp.message(F.text == BTN_EDIT_AGREED)
+async def m_start_edit(message: Message, state: FSMContext) -> None:
+    await _pick_account(message, state, Flow.m_acc_edit, "Qaysi hisobdagi usta?")
+
+
+@dp.message(Flow.m_acc_edit)
+async def m_edit_account(message: Message, state: FSMContext) -> None:
+    try:
+        chosen = await _resolve_account(message)
+        if chosen is None:
+            return
+        masters = await asyncio.to_thread(sheets.get_masters, message.from_user.id,
+                                          message.from_user.full_name, chosen)
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+    if not masters:
+        await state.clear()
+        await message.answer(f"«{chosen}» hisobida usta yo'q.", reply_markup=masters_menu)
+        return
+    await state.update_data(m_account=chosen)
+    await state.set_state(Flow.m_pick_edit)
+    await message.answer("Kimning kelishuvi o'zgarsin?",
+                         reply_markup=master_keyboard([m for m, _ in masters]))
+
+
+@dp.message(Flow.m_pick_edit)
+async def m_edit_pick(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    try:
+        masters = await asyncio.to_thread(sheets.get_masters, message.from_user.id,
+                                          message.from_user.full_name, data["m_account"])
+        names = [m for m, _ in masters]
+        chosen = next((m for m in names if m == (message.text or "")), None)
+        if chosen is None:
+            await message.answer("Iltimos, tugmalardan tanlang.",
+                                 reply_markup=master_keyboard(names))
+            return
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+        eski = next(a for m, a in masters if m == chosen)
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    await state.update_data(m_name=chosen)
+    await state.set_state(Flow.m_new_agreed)
+    await message.answer(
+        f"<b>{chosen}</b> — hozirgi kelishuv: {format_money(eski, cur)}\n"
+        f"Yangi summani yozing (faqat raqam):",
+        reply_markup=cancel_menu,
+    )
+
+
+@dp.message(Flow.m_new_agreed)
+async def m_edit_agreed(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    agreed = 0.0 if raw == "0" else parse_amount(raw)
+    if agreed is None:
+        await message.answer("Faqat raqam yozing.")
+        return
+    data = await state.get_data()
+    try:
+        await asyncio.to_thread(
+            sheets.set_master_agreed, message.from_user.id, message.from_user.full_name,
+            data["m_account"], data["m_name"], agreed,
+        )
+        cur = await asyncio.to_thread(sheets.get_currency, message.from_user.id,
+                                      message.from_user.full_name, data["m_account"])
+    except sheets.AccountError as exc:
+        await state.clear(); await message.answer(f"⚠️ {exc}", reply_markup=main_menu); return
+    except sheets.SheetsError:
+        await state.clear(); await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu); return
+
+    await state.clear()
+    await message.answer(
+        f"✏️ <b>{data['m_name']}</b> kelishuvi: {format_money(agreed, cur)}",
+        reply_markup=main_menu,
+    )
 
 
 async def main() -> None:
