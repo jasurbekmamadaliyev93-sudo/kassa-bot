@@ -138,6 +138,7 @@ def _ensure_service_sheet(title: str, headers: list, legacy: list | None = None)
         ws.append_row(headers)
         return ws
 
+    _ensure_cols(ws, len(headers))
     first = ws.row_values(1)
     if first == headers:
         return ws
@@ -160,6 +161,22 @@ def _apply_amount_format(ws) -> None:
         ws.format("D2:D", AMOUNT_FORMAT)
     except Exception as exc:  # noqa: BLE001 - format bo'lmasa ham bot ishlashda davom etsin
         logger.warning(f"Summa ustuni formatini qo'llab bo'lmadi: {exc}")
+
+
+def _ensure_cols(ws, need: int) -> None:
+    """Jadvalda kamida `need` ta ustun bo'lishini ta'minlaydi.
+    Google Sheets mavjud katak chegarasidan tashqariga yozishga ruxsat bermaydi,
+    shuning uchun yangi ustun qo'shishdan oldin gridni kengaytiramiz."""
+    try:
+        current = int(getattr(ws, "col_count", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return
+    if current and current < need:
+        try:
+            ws.add_cols(need - current)
+            logger.info(f"«{ws.title}» listi {need} ustungacha kengaytirildi.")
+        except Exception as exc:  # noqa: BLE001
+            raise SheetsError(f"Ustun qo'shib bo'lmadi: {exc}") from exc
 
 
 def _check_ready():
@@ -224,6 +241,7 @@ def get_user_sheet(user_id: int, user_name: str):
                 _register_user(user_id, user_name, title)
                 # Hisoblar get_accounts() ichida bir marta yaratiladi — bu yerda takrorlamaymiz
 
+            _ensure_cols(ws, len(USER_HEADERS))
             first = ws.row_values(1)
             if first != USER_HEADERS:
                 if first == USER_HEADERS_LEGACY:
