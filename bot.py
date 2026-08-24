@@ -1,9 +1,12 @@
 """
 Kirim-chiqim hisobini yurituvchi Telegram bot.
-Barcha ma'lumotlar Google Sheets jadvalida saqlanadi (lokal baza ishlatilmaydi).
+
+- Har bir foydalanuvchi uchun Google jadvalda ALOHIDA list ochiladi (ismi bilan).
+- Har bir foydalanuvchi bir nechta hisob yuritishi mumkin (masalan "Imzo showroom"
+  va "Shaxsiy") — ular bir-biriga umuman aralashmaydi.
+- Har bir kirim/chiqimda qaysi hisobga yozilishi so'raladi.
 
 Ishga tushirish: python bot.py
-Sozlamalar config.py faylidan yoki muhit o'zgaruvchilaridan olinadi.
 """
 import asyncio
 import logging
@@ -13,7 +16,7 @@ import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -45,36 +48,68 @@ BTN_EXPENSE = "➖ Chiqim qo'shish"
 BTN_BALANCE = "💰 Balans"
 BTN_HISTORY = "📜 Tarix"
 BTN_UNDO = "🗑 Oxirgisini o'chirish"
+BTN_ACCOUNTS = "⚙️ Hisoblarim"
 BTN_CANCEL = "❌ Bekor qilish"
+BTN_ADD_ACCOUNT = "➕ Yangi hisob"
+BTN_DEL_ACCOUNT = "🗑 Hisobni o'chirish"
+BTN_BACK = "⬅️ Orqaga"
 
-SHEETS_ERROR_TEXT = (
-    "⚠️ Hozircha jadval bilan bog'lanib bo'lmadi. Biroz kutib, qayta urinib ko'ring."
-)
+MENU_WORDS = {
+    BTN_INCOME, BTN_EXPENSE, BTN_BALANCE, BTN_HISTORY, BTN_UNDO,
+    BTN_ACCOUNTS, BTN_CANCEL, BTN_ADD_ACCOUNT, BTN_DEL_ACCOUNT, BTN_BACK,
+}
+
+SHEETS_ERROR_TEXT = "⚠️ Jadval bilan bog'lanib bo'lmadi. Biroz kutib, qayta urinib ko'ring."
 
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_INCOME), KeyboardButton(text=BTN_EXPENSE)],
         [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HISTORY)],
-        [KeyboardButton(text=BTN_UNDO)],
+        [KeyboardButton(text=BTN_UNDO), KeyboardButton(text=BTN_ACCOUNTS)],
     ],
     resize_keyboard=True,
 )
 
 cancel_menu = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
+    keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True
+)
+
+accounts_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_ADD_ACCOUNT), KeyboardButton(text=BTN_DEL_ACCOUNT)],
+        [KeyboardButton(text=BTN_BACK)],
+    ],
     resize_keyboard=True,
 )
 
 
-class AddTransaction(StatesGroup):
-    waiting_for_amount = State()
+def account_keyboard(accounts: list) -> ReplyKeyboardMarkup:
+    """Hisoblar ro'yxatidan tugmalar (ikkitadan bir qatorga) + Bekor qilish."""
+    rows, buf = [], []
+    for acc in accounts:
+        buf.append(KeyboardButton(text=acc))
+        if len(buf) == 2:
+            rows.append(buf)
+            buf = []
+    if buf:
+        rows.append(buf)
+    rows.append([KeyboardButton(text=BTN_CANCEL)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+class Flow(StatesGroup):
+    choose_account_add = State()      # kirim/chiqim uchun hisob tanlash
+    enter_amount = State()            # summa kiritish
+    choose_account_history = State()  # tarix uchun hisob tanlash
+    choose_account_undo = State()     # o'chirish uchun hisob tanlash
+    enter_new_account = State()       # yangi hisob nomi
+    choose_account_delete = State()   # o'chiriladigan hisobni tanlash
 
 
 AMOUNT_RE = re.compile(r"^\s*([\d\s.,]+)\s*(.*)$")
 
 
 def parse_amount_and_note(text: str) -> tuple[float, str] | None:
-    """'50000 oylik maosh' -> (50000.0, 'oylik maosh'). Notogri bo'lsa None."""
     match = AMOUNT_RE.match(text)
     if not match:
         return None
@@ -93,20 +128,28 @@ def format_money(amount: float) -> str:
     return f"{amount:,.0f}".replace(",", " ")
 
 
-def format_balance(bal: dict) -> str:
-    return (
-        f"💰 <b>Balans</b>\n\n"
-        f"➕ Jami kirim: {format_money(bal['income'])} so'm\n"
-        f"➖ Jami chiqim: {format_money(bal['expense'])} so'm\n"
-        f"—————————————\n"
-        f"<b>Qoldiq: {format_money(bal['balance'])} so'm</b>"
-    )
+def format_all_balances(balances: dict) -> str:
+    if not balances:
+        return "Hisoblar topilmadi."
+    lines = ["💰 <b>Balans</b>"]
+    total = 0.0
+    for account, b in balances.items():
+        total += b["balance"]
+        lines.append(
+            f"\n<b>{account}</b>\n"
+            f"  ➕ Kirim: {format_money(b['income'])} so'm\n"
+            f"  ➖ Chiqim: {format_money(b['expense'])} so'm\n"
+            f"  <b>Qoldiq: {format_money(b['balance'])} so'm</b>"
+        )
+    if len(balances) > 1:
+        lines.append(f"\n—————————————\n<b>Umumiy qoldiq: {format_money(total)} so'm</b>")
+    return "\n".join(lines)
 
 
-def format_history(records: list) -> str:
+def format_history(account: str, records: list) -> str:
     if not records:
-        return "Hozircha hech qanday yozuv yo'q."
-    lines = ["📜 <b>Oxirgi yozuvlar</b>\n"]
+        return f"«{account}» hisobida hozircha yozuv yo'q."
+    lines = [f"📜 <b>{account}</b> — oxirgi yozuvlar\n"]
     for r in records:
         sign = "➕" if r["type"] == "income" else "➖"
         note = f" — {r['note']}" if r["note"] else ""
@@ -117,13 +160,34 @@ def format_history(records: list) -> str:
 dp = Dispatcher(storage=MemoryStorage())
 
 
+async def load_accounts(message: Message) -> list:
+    return await asyncio.to_thread(
+        sheets.get_accounts, message.from_user.id, message.from_user.full_name
+    )
+
+
+# --- Bekor qilish (istalgan holatda ishlaydi, shuning uchun birinchi) ---
+
+@dp.message(F.text == BTN_CANCEL)
+async def cancel_action(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=main_menu)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT)
+        return
     await message.answer(
         "Assalomu alaykum! 👋\n\n"
         "Men — shaxsiy kassa botiman. Olgan va bergan pullaringizni hisob-kitob qilib beraman.\n\n"
-        "Quyidagi menyudan foydalaning:",
+        f"Sizning hisoblaringiz: <b>{'</b>, <b>'.join(accounts)}</b>\n"
+        "Ularni ⚙️ Hisoblarim bo'limida o'zgartirishingiz mumkin.",
         reply_markup=main_menu,
     )
 
@@ -132,136 +196,289 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(
         "<b>Qo'llanma</b>\n\n"
-        f"{BTN_INCOME} — kirim (olgan pulingiz) qo'shish\n"
-        f"{BTN_EXPENSE} — chiqim (bergan/sarflagan pulingiz) qo'shish\n"
-        f"{BTN_BALANCE} — joriy balansni ko'rish\n"
-        f"{BTN_HISTORY} — so'nggi yozuvlar tarixi\n"
-        f"{BTN_UNDO} — oxirgi yozuvni bekor qilish\n\n"
-        "Summani kiritishda izoh ham yozishingiz mumkin, masalan:\n"
-        "<code>50000 oylik maosh</code>",
+        f"{BTN_INCOME} — olgan pulingizni yozish\n"
+        f"{BTN_EXPENSE} — bergan/sarflagan pulingizni yozish\n"
+        f"{BTN_BALANCE} — barcha hisoblar bo'yicha balans\n"
+        f"{BTN_HISTORY} — tanlangan hisobning so'nggi yozuvlari\n"
+        f"{BTN_UNDO} — oxirgi yozuvni bekor qilish\n"
+        f"{BTN_ACCOUNTS} — hisob qo'shish yoki o'chirish\n\n"
+        "Har bir yozuv qaysi hisobga tegishli ekani so'raladi — hisoblar "
+        "bir-biriga aralashmaydi.\n\n"
+        "Summani izoh bilan birga yozish mumkin:\n<code>50000 oylik maosh</code>",
         reply_markup=main_menu,
     )
 
 
-@dp.message(F.text == BTN_CANCEL)
-async def cancel_action(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Bekor qilindi.", reply_markup=main_menu)
+# --- Kirim / chiqim qo'shish ---
+
+@dp.message(StateFilter(None), F.text.in_({BTN_INCOME, BTN_EXPENSE}))
+async def start_transaction(message: Message, state: FSMContext) -> None:
+    tx_type = "income" if message.text == BTN_INCOME else "expense"
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+
+    await state.set_state(Flow.choose_account_add)
+    await state.update_data(tx_type=tx_type)
+    word = "Kirim" if tx_type == "income" else "Chiqim"
+    await message.answer(f"{word} qaysi hisobga yozilsin?", reply_markup=account_keyboard(accounts))
 
 
-@dp.message(F.text == BTN_INCOME)
-async def start_income(message: Message, state: FSMContext) -> None:
-    await state.set_state(AddTransaction.waiting_for_amount)
-    await state.update_data(tx_type="income")
+@dp.message(Flow.choose_account_add)
+async def picked_account_add(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await state.clear()
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+
+    chosen = next((a for a in accounts if a == (message.text or "")), None)
+    if chosen is None:
+        await message.answer(
+            "Iltimos, quyidagi tugmalardan hisobni tanlang.",
+            reply_markup=account_keyboard(accounts),
+        )
+        return
+
+    data = await state.get_data()
+    await state.set_state(Flow.enter_amount)
+    await state.update_data(account=chosen)
+    word = "oldingiz" if data["tx_type"] == "income" else "berdingiz/sarfladingiz"
+    example = "200000 mijozdan to'lov" if data["tx_type"] == "income" else "50000 transport"
     await message.answer(
-        "Qancha pul oldingiz? Summani kiriting (xohlasangiz izoh bilan birga):\n"
-        "Masalan: <code>200000 mijozdan to'lov</code>",
+        f"«{chosen}» — qancha pul {word}?\n"
+        f"Summani kiriting (xohlasangiz izoh bilan):\nMasalan: <code>{example}</code>",
         reply_markup=cancel_menu,
     )
 
 
-@dp.message(F.text == BTN_EXPENSE)
-async def start_expense(message: Message, state: FSMContext) -> None:
-    await state.set_state(AddTransaction.waiting_for_amount)
-    await state.update_data(tx_type="expense")
-    await message.answer(
-        "Qancha pul berdingiz/sarfladingiz? Summani kiriting (xohlasangiz izoh bilan birga):\n"
-        "Masalan: <code>50000 transport</code>",
-        reply_markup=cancel_menu,
-    )
-
-
-@dp.message(AddTransaction.waiting_for_amount)
+@dp.message(Flow.enter_amount)
 async def process_amount(message: Message, state: FSMContext) -> None:
     parsed = parse_amount_and_note(message.text or "")
     if parsed is None:
         await message.answer(
-            "Summani to'g'ri kiriting. Masalan: <code>50000</code> yoki <code>50000 oziq-ovqat</code>",
+            "Summani to'g'ri kiriting. Masalan: <code>50000</code> yoki <code>50000 oziq-ovqat</code>"
         )
         return
 
     amount, note = parsed
     data = await state.get_data()
-    tx_type = data["tx_type"]
+    tx_type, account = data["tx_type"], data["account"]
 
     try:
         await asyncio.to_thread(
             sheets.add_transaction,
-            message.from_user.id,
-            message.from_user.full_name,
-            tx_type,
-            amount,
-            note,
+            message.from_user.id, message.from_user.full_name,
+            account, tx_type, amount, note,
         )
     except sheets.SheetsError as exc:
         logger.warning(f"Jadvalga yozib bo'lmadi: {exc}")
+        await state.clear()
         await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
         return
-    finally:
-        await state.clear()
 
+    await state.clear()
     label = "Kirim" if tx_type == "income" else "Chiqim"
     icon = "➕" if tx_type == "income" else "➖"
     note_text = f" ({note})" if note else ""
     await message.answer(
-        f"{icon} {label} qo'shildi: {format_money(amount)} so'm{note_text}",
+        f"{icon} <b>{account}</b> — {label} qo'shildi: {format_money(amount)} so'm{note_text}",
         reply_markup=main_menu,
     )
 
 
-@dp.message(F.text == BTN_BALANCE)
+# --- Balans (barcha hisoblar birdan) ---
+
+@dp.message(StateFilter(None), F.text == BTN_BALANCE)
 async def show_balance(message: Message) -> None:
     try:
-        bal = await asyncio.to_thread(sheets.get_balance, message.from_user.id)
+        balances = await asyncio.to_thread(
+            sheets.get_all_balances, message.from_user.id, message.from_user.full_name
+        )
     except sheets.SheetsError as exc:
         logger.warning(f"Balansni o'qib bo'lmadi: {exc}")
         await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
         return
-    await message.answer(format_balance(bal), reply_markup=main_menu)
+    await message.answer(format_all_balances(balances), reply_markup=main_menu)
 
 
-@dp.message(F.text == BTN_HISTORY)
-async def show_history(message: Message) -> None:
+# --- Tarix ---
+
+@dp.message(StateFilter(None), F.text == BTN_HISTORY)
+async def start_history(message: Message, state: FSMContext) -> None:
     try:
-        records = await asyncio.to_thread(sheets.get_history, message.from_user.id, 10)
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    await state.set_state(Flow.choose_account_history)
+    await message.answer("Qaysi hisob tarixini ko'rsatay?", reply_markup=account_keyboard(accounts))
+
+
+@dp.message(Flow.choose_account_history)
+async def picked_account_history(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+        chosen = next((a for a in accounts if a == (message.text or "")), None)
+        if chosen is None:
+            await message.answer("Iltimos, tugmalardan tanlang.", reply_markup=account_keyboard(accounts))
+            return
+        records = await asyncio.to_thread(
+            sheets.get_history, message.from_user.id, message.from_user.full_name, chosen, 10
+        )
     except sheets.SheetsError as exc:
         logger.warning(f"Tarixni o'qib bo'lmadi: {exc}")
+        await state.clear()
         await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
         return
-    await message.answer(format_history(records), reply_markup=main_menu)
+    await state.clear()
+    await message.answer(format_history(chosen, records), reply_markup=main_menu)
 
 
-@dp.message(F.text == BTN_UNDO)
-async def undo_last(message: Message) -> None:
+# --- Oxirgi yozuvni o'chirish ---
+
+@dp.message(StateFilter(None), F.text == BTN_UNDO)
+async def start_undo(message: Message, state: FSMContext) -> None:
     try:
-        deleted = await asyncio.to_thread(sheets.delete_last, message.from_user.id)
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    await state.set_state(Flow.choose_account_undo)
+    await message.answer(
+        "Qaysi hisobning oxirgi yozuvi o'chirilsin?", reply_markup=account_keyboard(accounts)
+    )
+
+
+@dp.message(Flow.choose_account_undo)
+async def picked_account_undo(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+        chosen = next((a for a in accounts if a == (message.text or "")), None)
+        if chosen is None:
+            await message.answer("Iltimos, tugmalardan tanlang.", reply_markup=account_keyboard(accounts))
+            return
+        deleted = await asyncio.to_thread(
+            sheets.delete_last, message.from_user.id, message.from_user.full_name, chosen
+        )
     except sheets.SheetsError as exc:
         logger.warning(f"Yozuvni o'chirib bo'lmadi: {exc}")
+        await state.clear()
         await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
         return
 
+    await state.clear()
     if deleted is None:
-        await message.answer("O'chiriladigan yozuv topilmadi.", reply_markup=main_menu)
+        await message.answer(f"«{chosen}» hisobida o'chiriladigan yozuv yo'q.", reply_markup=main_menu)
         return
     label = "Kirim" if deleted["type"] == "income" else "Chiqim"
     await message.answer(
-        f"O'chirildi: {label} — {format_money(deleted['amount'])} so'm",
+        f"O'chirildi: <b>{chosen}</b> — {label} {format_money(deleted['amount'])} so'm",
         reply_markup=main_menu,
     )
 
 
+# --- Hisoblarni boshqarish ---
+
+@dp.message(StateFilter(None), F.text == BTN_ACCOUNTS)
+async def show_accounts(message: Message) -> None:
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    listed = "\n".join(f"• {a}" for a in accounts)
+    await message.answer(f"⚙️ <b>Hisoblaringiz</b>\n\n{listed}", reply_markup=accounts_menu)
+
+
+@dp.message(F.text == BTN_BACK)
+async def back_to_main(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Asosiy menyu", reply_markup=main_menu)
+
+
+@dp.message(F.text == BTN_ADD_ACCOUNT)
+async def start_add_account(message: Message, state: FSMContext) -> None:
+    await state.set_state(Flow.enter_new_account)
+    await message.answer(
+        "Yangi hisob nomini yozing (masalan: <code>Do'kon</code> yoki <code>Mashina</code>):",
+        reply_markup=cancel_menu,
+    )
+
+
+@dp.message(Flow.enter_new_account)
+async def process_new_account(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if name in MENU_WORDS:
+        await message.answer("Bu nom menyu tugmasi bilan bir xil. Boshqa nom tanlang.")
+        return
+    try:
+        created = await asyncio.to_thread(
+            sheets.add_account, message.from_user.id, message.from_user.full_name, name
+        )
+    except sheets.AccountError as exc:
+        await message.answer(f"⚠️ {exc}")
+        return
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisob qo'shib bo'lmadi: {exc}")
+        await state.clear()
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+
+    await state.clear()
+    await message.answer(f"✅ «{created}» hisobi qo'shildi.", reply_markup=main_menu)
+
+
+@dp.message(F.text == BTN_DEL_ACCOUNT)
+async def start_delete_account(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    await state.set_state(Flow.choose_account_delete)
+    await message.answer("Qaysi hisob o'chirilsin?", reply_markup=account_keyboard(accounts))
+
+
+@dp.message(Flow.choose_account_delete)
+async def process_delete_account(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+        chosen = next((a for a in accounts if a == (message.text or "")), None)
+        if chosen is None:
+            await message.answer("Iltimos, tugmalardan tanlang.", reply_markup=account_keyboard(accounts))
+            return
+        await asyncio.to_thread(
+            sheets.delete_account, message.from_user.id, message.from_user.full_name, chosen
+        )
+    except sheets.AccountError as exc:
+        await state.clear()
+        await message.answer(f"⚠️ {exc}", reply_markup=main_menu)
+        return
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisobni o'chirib bo'lmadi: {exc}")
+        await state.clear()
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+
+    await state.clear()
+    await message.answer(f"🗑 «{chosen}» hisobi o'chirildi.", reply_markup=main_menu)
+
+
 async def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit(
-            "BOT_TOKEN topilmadi. Uni BOT_TOKEN muhit o'zgaruvchisi orqali yoki "
-            "config.py faylida BOT_TOKEN = '...' ko'rinishida bering."
-        )
-
+        raise SystemExit("BOT_TOKEN topilmadi.")
     if not sheets.init_sheets(GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON):
-        raise SystemExit(
-            "Google Sheets bilan ulanib bo'lmadi. GOOGLE_SHEET_ID va kalit sozlamalarini tekshiring "
-            "(yuqoridagi xato xabariga qarang)."
-        )
+        raise SystemExit("Google Sheets bilan ulanib bo'lmadi — yuqoridagi xatoga qarang.")
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=True)
