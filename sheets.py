@@ -187,7 +187,7 @@ def get_user_sheet(user_id: int, user_name: str):
                 ws = _spreadsheet.add_worksheet(title=title, rows=1000, cols=len(USER_HEADERS))
                 ws.append_row(USER_HEADERS)
                 _register_user(user_id, user_name, title)
-                _set_accounts(user_id, DEFAULT_ACCOUNTS)
+                # Hisoblar get_accounts() ichida bir marta yaratiladi — bu yerda takrorlamaymiz
 
             if ws.row_values(1) != USER_HEADERS:
                 ws.insert_row(USER_HEADERS, index=1)
@@ -220,11 +220,14 @@ def get_accounts(user_id: int, user_name: str = "") -> list:
             return list(cached)
         try:
             ws = _spreadsheet.worksheet(ACCOUNTS_SHEET)
-            found = [
-                row[1].strip()
-                for row in ws.get_all_values()[1:]
-                if len(row) >= 2 and row[0].strip() == str(user_id) and row[1].strip()
-            ]
+            found, seen = [], set()
+            for row in ws.get_all_values()[1:]:
+                if len(row) < 2 or row[0].strip() != str(user_id):
+                    continue
+                acc = row[1].strip()
+                if acc and acc.casefold() not in seen:
+                    seen.add(acc.casefold())
+                    found.append(acc)
         except Exception as exc:  # noqa: BLE001
             raise SheetsError(str(exc)) from exc
 
@@ -291,12 +294,13 @@ def delete_account(user_id: int, user_name: str, name: str) -> None:
 
         try:
             ws = _spreadsheet.worksheet(ACCOUNTS_SHEET)
-            for idx, row in enumerate(ws.get_all_values(), start=1):
-                if idx == 1:
-                    continue
-                if len(row) >= 2 and row[0].strip() == str(user_id) and row[1].strip().casefold() == match.casefold():
-                    ws.delete_rows(idx)
-                    break
+            targets = [
+                idx for idx, row in enumerate(ws.get_all_values(), start=1)
+                if idx > 1 and len(row) >= 2 and row[0].strip() == str(user_id)
+                and row[1].strip().casefold() == match.casefold()
+            ]
+            for idx in reversed(targets):   # pastdan yuqoriga — raqamlar surilmasligi uchun
+                ws.delete_rows(idx)
         except Exception as exc:  # noqa: BLE001
             raise SheetsError(str(exc)) from exc
         _accounts_cache[user_id] = [a for a in existing if a.casefold() != match.casefold()]
