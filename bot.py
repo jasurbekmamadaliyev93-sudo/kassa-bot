@@ -53,10 +53,11 @@ BTN_CANCEL = "❌ Bekor qilish"
 BTN_ADD_ACCOUNT = "➕ Yangi hisob"
 BTN_DEL_ACCOUNT = "🗑 Hisobni o'chirish"
 BTN_BACK = "⬅️ Orqaga"
+BTN_NO_NOTE = "➡️ Izohsiz saqlash"
 
 MENU_WORDS = {
     BTN_INCOME, BTN_EXPENSE, BTN_BALANCE, BTN_HISTORY, BTN_UNDO,
-    BTN_ACCOUNTS, BTN_CANCEL, BTN_ADD_ACCOUNT, BTN_DEL_ACCOUNT, BTN_BACK,
+    BTN_ACCOUNTS, BTN_CANCEL, BTN_ADD_ACCOUNT, BTN_DEL_ACCOUNT, BTN_BACK, BTN_NO_NOTE,
 }
 
 SHEETS_ERROR_TEXT = "⚠️ Jadval bilan bog'lanib bo'lmadi. Biroz kutib, qayta urinib ko'ring."
@@ -72,6 +73,11 @@ main_menu = ReplyKeyboardMarkup(
 
 cancel_menu = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True
+)
+
+note_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=BTN_NO_NOTE)], [KeyboardButton(text=BTN_CANCEL)]],
+    resize_keyboard=True,
 )
 
 accounts_menu = ReplyKeyboardMarkup(
@@ -99,29 +105,33 @@ def account_keyboard(accounts: list) -> ReplyKeyboardMarkup:
 
 class Flow(StatesGroup):
     choose_account_add = State()      # kirim/chiqim uchun hisob tanlash
-    enter_amount = State()            # summa kiritish
+    enter_amount = State()            # summa kiritish (faqat raqam)
+    enter_note = State()              # izoh kiritish (alohida qadam)
     choose_account_history = State()  # tarix uchun hisob tanlash
     choose_account_undo = State()     # o'chirish uchun hisob tanlash
     enter_new_account = State()       # yangi hisob nomi
     choose_account_delete = State()   # o'chiriladigan hisobni tanlash
 
 
-AMOUNT_RE = re.compile(r"^\s*([\d\s.,]+)\s*(.*)$")
+AMOUNT_RE = re.compile(r"^[\d\s.,']+$")
 
 
-def parse_amount_and_note(text: str) -> tuple[float, str] | None:
-    match = AMOUNT_RE.match(text)
-    if not match:
+def parse_amount(text: str) -> float | None:
+    """Faqat summa qabul qilinadi. '20 000' yoki '20000' — ha; '20000 taksi' — yo'q."""
+    raw = (text or "").strip()
+    if not raw or not AMOUNT_RE.match(raw):
         return None
-    raw_amount = match.group(1).replace(" ", "").replace(",", "")
-    note = match.group(2).strip()
+    for ch in (" ", " ", " ", "'", "`"):
+        raw = raw.replace(ch, "")
+    if "," in raw and "." not in raw:
+        raw = raw.replace(",", ".")
+    else:
+        raw = raw.replace(",", "")
     try:
-        amount = float(raw_amount)
+        amount = float(raw)
     except ValueError:
         return None
-    if amount <= 0:
-        return None
-    return amount, note
+    return amount if amount > 0 else None
 
 
 def format_money(amount: float) -> str:
@@ -205,7 +215,8 @@ async def cmd_help(message: Message) -> None:
         "Har bir yozuv qaysi hisobga tegishli ekani so'raladi — hisoblar "
         "bir-biriga aralashmaydi.\n\n"
         "❗️ Chiqim hisobdagi qoldiqdan oshmaydi — balans hech qachon manfiy bo'lmaydi.\n\n"
-        "Summani izoh bilan birga yozish mumkin:\n<code>50000 oylik maosh</code>",
+        "Avval summa, keyin izoh alohida so'raladi. Izoh shart emas — "
+        f"«{BTN_NO_NOTE}» tugmasi bilan o'tkazib yuborish mumkin.",
         reply_markup=main_menu,
     )
 
@@ -250,26 +261,59 @@ async def picked_account_add(message: Message, state: FSMContext) -> None:
     await state.set_state(Flow.enter_amount)
     await state.update_data(account=chosen)
     word = "oldingiz" if data["tx_type"] == "income" else "berdingiz/sarfladingiz"
-    example = "200000 mijozdan to'lov" if data["tx_type"] == "income" else "50000 transport"
     await message.answer(
         f"«{chosen}» — qancha pul {word}?\n"
-        f"Summani kiriting (xohlasangiz izoh bilan):\nMasalan: <code>{example}</code>",
+        f"Faqat summani kiriting: <code>50000</code>\n"
+        f"<i>(izohni keyingi qadamda so'rayman)</i>",
         reply_markup=cancel_menu,
     )
 
 
 @dp.message(Flow.enter_amount)
 async def process_amount(message: Message, state: FSMContext) -> None:
-    parsed = parse_amount_and_note(message.text or "")
-    if parsed is None:
+    amount = parse_amount(message.text or "")
+    if amount is None:
         await message.answer(
-            "Summani to'g'ri kiriting. Masalan: <code>50000</code> yoki <code>50000 oziq-ovqat</code>"
+            "Faqat summani kiriting, izohsiz. Masalan: <code>50000</code> yoki <code>50 000</code>"
         )
         return
 
-    amount, note = parsed
     data = await state.get_data()
-    tx_type, account = data["tx_type"], data["account"]
+
+    # Chiqim bo'lsa — izoh so'rashdan OLDIN qoldiqni tekshiramiz
+    if data["tx_type"] == "expense":
+        try:
+            await asyncio.to_thread(
+                sheets.ensure_can_spend,
+                message.from_user.id, message.from_user.full_name,
+                data["account"], amount,
+            )
+        except sheets.AccountError as exc:
+            await message.answer(f"⚠️ {exc}\n\nBoshqa summa kiriting yoki bekor qiling.")
+            return
+        except sheets.SheetsError as exc:
+            logger.warning(f"Qoldiqni tekshirib bo'lmadi: {exc}")
+            await state.clear()
+            await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+            return
+
+    await state.update_data(amount=amount)
+    await state.set_state(Flow.enter_note)
+    await message.answer(
+        f"Summa: <b>{format_money(amount)} so'm</b>\n\n"
+        f"Endi izoh yozing (masalan: <code>transport</code>),\n"
+        f"yoki «{BTN_NO_NOTE}» tugmasini bosing.",
+        reply_markup=note_menu,
+    )
+
+
+@dp.message(Flow.enter_note)
+async def process_note(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    note = "" if text == BTN_NO_NOTE else text[:200]
+
+    data = await state.get_data()
+    tx_type, account, amount = data["tx_type"], data["account"], data["amount"]
 
     try:
         await asyncio.to_thread(
@@ -278,8 +322,9 @@ async def process_amount(message: Message, state: FSMContext) -> None:
             account, tx_type, amount, note,
         )
     except sheets.AccountError as exc:
-        # Masalan: chiqim qoldiqdan oshib ketdi — holatni saqlaymiz, qayta urinsin
-        await message.answer(f"⚠️ {exc}\n\nBoshqa summa kiriting yoki bekor qiling.")
+        # Izoh yozayotgan paytda qoldiq o'zgargan bo'lsa
+        await state.clear()
+        await message.answer(f"⚠️ {exc}", reply_markup=main_menu)
         return
     except sheets.SheetsError as exc:
         logger.warning(f"Jadvalga yozib bo'lmadi: {exc}")

@@ -128,6 +128,18 @@ def _ensure_service_sheet(title: str, headers: list):
     return ws
 
 
+AMOUNT_FORMAT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
+
+
+def _apply_amount_format(ws) -> None:
+    """Summa ustunini '20 000' ko'rinishida ko'rsatadi.
+    Qiymat baribir SON bo'lib qoladi — jadvalda formulalar ishlayveradi."""
+    try:
+        ws.format("D2:D", AMOUNT_FORMAT)
+    except Exception as exc:  # noqa: BLE001 - format bo'lmasa ham bot ishlashda davom etsin
+        logger.warning(f"Summa ustuni formatini qo'llab bo'lmadi: {exc}")
+
+
 def _check_ready():
     if not _enabled or _spreadsheet is None:
         raise SheetsError("Google Sheets ulanmagan")
@@ -193,6 +205,7 @@ def get_user_sheet(user_id: int, user_name: str):
             if ws.row_values(1) != USER_HEADERS:
                 ws.insert_row(USER_HEADERS, index=1)
 
+            _apply_amount_format(ws)
             _user_ws_cache[user_id] = ws
             return ws
         except SheetsError:
@@ -349,6 +362,17 @@ def _fmt(amount: float) -> str:
     return f"{amount:,.0f}".replace(",", " ")
 
 
+def ensure_can_spend(user_id: int, user_name: str, account: str, amount: float) -> None:
+    """Chiqim qoldiqdan oshsa AccountError ko'taradi — balans manfiyga tushmaydi."""
+    current = get_balance(user_id, user_name, account)["balance"]
+    if amount > current + 0.001:      # kasr xatoliklariga kichik yo'l qo'yiladi
+        raise AccountError(
+            f"«{account}» hisobida buncha mablag' yo'q.\n"
+            f"Mavjud qoldiq: <b>{_fmt(current)} so'm</b>, "
+            f"siz esa {_fmt(amount)} so'm chiqim qilmoqchisiz."
+        )
+
+
 def add_transaction(user_id: int, user_name: str, account: str,
                     tx_type: str, amount: float, note: str = "") -> None:
     """Yangi yozuv qo'shadi.
@@ -360,13 +384,7 @@ def add_transaction(user_id: int, user_name: str, account: str,
         raise ValueError("Summa musbat son bo'lishi kerak")
 
     if tx_type == "expense":
-        current = get_balance(user_id, user_name, account)["balance"]
-        if amount > current + 0.001:     # kasr xatoliklariga kichik yo'l qo'yiladi
-            raise AccountError(
-                f"«{account}» hisobida buncha mablag' yo'q.\n"
-                f"Mavjud qoldiq: <b>{_fmt(current)} so'm</b>, "
-                f"siz esa {_fmt(amount)} so'm chiqim qilmoqchisiz."
-            )
+        ensure_can_spend(user_id, user_name, account, amount)
 
     ws = get_user_sheet(user_id, user_name)
     label = LABEL_INCOME if tx_type == "income" else LABEL_EXPENSE
