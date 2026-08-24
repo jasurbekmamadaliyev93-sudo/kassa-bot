@@ -5,7 +5,7 @@ Tuzilishi:
 - Har bir foydalanuvchi uchun ALOHIDA list (tab), nomi foydalanuvchi ismi bilan.
   Ustunlari: Sana | Hisob | Turi | Summa | Izoh
 - "_Users"    — xizmat listi: User ID | Ism | List nomi
-- "_Hisoblar" — xizmat listi: User ID | Hisob   (har kimning hisoblari ro'yxati)
+- "_Hisoblar" — xizmat listi: User ID | Hisob | Valyuta  (har kimning hisoblari)
 
 Har bir foydalanuvchining bir nechta hisobi bo'lishi mumkin (masalan "Imzo showroom"
 va "Shaxsiy"), ular bir-biriga umuman aralashmaydi.
@@ -25,7 +25,11 @@ USERS_SHEET = "_Users"
 USERS_HEADERS = ["User ID", "Ism", "List nomi"]
 
 ACCOUNTS_SHEET = "_Hisoblar"
-ACCOUNTS_HEADERS = ["User ID", "Hisob"]
+ACCOUNTS_HEADERS = ["User ID", "Hisob", "Valyuta"]
+ACCOUNTS_HEADERS_LEGACY = ["User ID", "Hisob"]      # eski format (valyutasiz)
+
+DEFAULT_CURRENCY = "so'm"
+CURRENCIES = ["so'm", "$"]
 
 DEFAULT_ACCOUNTS = ["Shaxsiy"]   # yangi foydalanuvchida faqat shu ochiladi,
                                  # qolganini o'zi qo'shadi
@@ -104,7 +108,7 @@ def init_sheets(credentials_file: str, sheet_id: str, credentials_json: str = ""
         spreadsheet = client.open_by_key(sheet_id)
         _spreadsheet = spreadsheet
         _ensure_service_sheet(USERS_SHEET, USERS_HEADERS)
-        _ensure_service_sheet(ACCOUNTS_SHEET, ACCOUNTS_HEADERS)
+        _ensure_service_sheet(ACCOUNTS_SHEET, ACCOUNTS_HEADERS, ACCOUNTS_HEADERS_LEGACY)
         _enabled = True
         logger.info("Google Sheets bilan ulanish muvaffaqiyatli o'rnatildi.")
         return True
@@ -115,16 +119,25 @@ def init_sheets(credentials_file: str, sheet_id: str, credentials_json: str = ""
         return False
 
 
-def _ensure_service_sheet(title: str, headers: list):
-    """Xizmat listi mavjudligini (va sarlavhasini) ta'minlaydi."""
+def _ensure_service_sheet(title: str, headers: list, legacy: list | None = None):
+    """Xizmat listi mavjudligini (va sarlavhasini) ta'minlaydi.
+    Eski sarlavha topilsa — uni JOYIDA yangilaydi, ma'lumot qatorlari surilmaydi."""
     try:
         ws = _spreadsheet.worksheet(title)
     except Exception:  # noqa: BLE001 - WorksheetNotFound
         ws = _spreadsheet.add_worksheet(title=title, rows=200, cols=len(headers))
         ws.append_row(headers)
         return ws
-    if ws.row_values(1) != headers:
+
+    first = ws.row_values(1)
+    if first == headers:
+        return ws
+    if legacy and first == legacy:
+        ws.delete_rows(1)
         ws.insert_row(headers, index=1)
+        logger.info(f"«{title}» listi sarlavhasi yangi formatga o'tkazildi.")
+        return ws
+    ws.insert_row(headers, index=1)
     return ws
 
 
@@ -221,12 +234,12 @@ def get_user_sheet(user_id: int, user_name: str):
 def _set_accounts(user_id: int, accounts: list):
     ws = _spreadsheet.worksheet(ACCOUNTS_SHEET)
     for acc in accounts:
-        ws.append_row([str(user_id), acc])
-    _accounts_cache[user_id] = list(accounts)
+        ws.append_row([str(user_id), acc, DEFAULT_CURRENCY])
+    _accounts_cache[user_id] = [(a, DEFAULT_CURRENCY) for a in accounts]
 
 
-def get_accounts(user_id: int, user_name: str = "") -> list:
-    """Foydalanuvchining hisoblari ro'yxati (bo'lmasa standartlari yaratiladi)."""
+def get_accounts_full(user_id: int, user_name: str = "") -> list:
+    """[(hisob nomi, valyuta), ...] ro'yxati (bo'lmasa standartlari yaratiladi)."""
     _check_ready()
     with _lock:
         cached = _accounts_cache.get(user_id)
@@ -239,20 +252,60 @@ def get_accounts(user_id: int, user_name: str = "") -> list:
                 if len(row) < 2 or row[0].strip() != str(user_id):
                     continue
                 acc = row[1].strip()
+                cur = (row[2].strip() if len(row) > 2 and row[2].strip() else DEFAULT_CURRENCY)
                 if acc and acc.casefold() not in seen:
                     seen.add(acc.casefold())
-                    found.append(acc)
+                    found.append((acc, cur))
         except Exception as exc:  # noqa: BLE001
             raise SheetsError(str(exc)) from exc
 
         if not found:
             _set_accounts(user_id, DEFAULT_ACCOUNTS)
-            found = list(DEFAULT_ACCOUNTS)
+            found = [(a, DEFAULT_CURRENCY) for a in DEFAULT_ACCOUNTS]
         _accounts_cache[user_id] = found
         return list(found)
 
 
-def add_account(user_id: int, user_name: str, name: str) -> str:
+def get_accounts(user_id: int, user_name: str = "") -> list:
+    """Faqat hisob nomlari (tugmalar uchun)."""
+    return [a for a, _ in get_accounts_full(user_id, user_name)]
+
+
+def get_currency(user_id: int, user_name: str, account: str) -> str:
+    """Hisobning valyutasi (topilmasa standart)."""
+    for a, cur in get_accounts_full(user_id, user_name):
+        if a.casefold() == account.casefold():
+            return cur or DEFAULT_CURRENCY
+    return DEFAULT_CURRENCY
+
+
+def set_account_currency(user_id: int, user_name: str, account: str, currency: str) -> None:
+    """Mavjud hisobning valyutasini o'zgartiradi."""
+    _check_ready()
+    if currency not in CURRENCIES:
+        raise AccountError(f"Noma'lum valyuta: {currency}")
+    with _lock:
+        existing = get_accounts_full(user_id, user_name)
+        match = next((a for a, _ in existing if a.casefold() == account.casefold()), None)
+        if match is None:
+            raise AccountError(f"«{account}» nomli hisob topilmadi.")
+        try:
+            ws = _spreadsheet.worksheet(ACCOUNTS_SHEET)
+            for idx, row in enumerate(ws.get_all_values(), start=1):
+                if idx == 1:
+                    continue
+                if (len(row) >= 2 and row[0].strip() == str(user_id)
+                        and row[1].strip().casefold() == match.casefold()):
+                    ws.update_cell(idx, 3, currency)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            raise SheetsError(str(exc)) from exc
+        _accounts_cache[user_id] = [
+            (a, currency if a.casefold() == match.casefold() else c) for a, c in existing
+        ]
+
+
+def add_account(user_id: int, user_name: str, name: str, currency: str = DEFAULT_CURRENCY) -> str:
     """Yangi hisob qo'shadi. Muvaffaqiyatli bo'lsa hisob nomini qaytaradi."""
     _check_ready()
     clean = " ".join((name or "").split())
@@ -262,16 +315,18 @@ def add_account(user_id: int, user_name: str, name: str) -> str:
         raise AccountError(f"Hisob nomi juda uzun (ko'pi bilan {MAX_ACCOUNT_NAME} ta belgi).")
 
     with _lock:
-        existing = get_accounts(user_id, user_name)
+        existing = get_accounts_full(user_id, user_name)
         if len(existing) >= MAX_ACCOUNTS:
             raise AccountError(f"Hisoblar soni chegarasi ({MAX_ACCOUNTS} ta) to'ldi.")
-        if any(a.casefold() == clean.casefold() for a in existing):
+        if any(a.casefold() == clean.casefold() for a, _ in existing):
             raise AccountError(f"«{clean}» nomli hisob allaqachon bor.")
+        if currency not in CURRENCIES:
+            currency = DEFAULT_CURRENCY
         try:
-            _spreadsheet.worksheet(ACCOUNTS_SHEET).append_row([str(user_id), clean])
+            _spreadsheet.worksheet(ACCOUNTS_SHEET).append_row([str(user_id), clean, currency])
         except Exception as exc:  # noqa: BLE001
             raise SheetsError(str(exc)) from exc
-        _accounts_cache[user_id] = existing + [clean]
+        _accounts_cache[user_id] = existing + [(clean, currency)]
         return clean
 
 
@@ -292,8 +347,8 @@ def delete_account(user_id: int, user_name: str, name: str) -> None:
     (pul ma'lumoti sezdirmay yo'qolib qolmasligi uchun)."""
     _check_ready()
     with _lock:
-        existing = get_accounts(user_id, user_name)
-        match = next((a for a in existing if a.casefold() == name.casefold()), None)
+        existing = get_accounts_full(user_id, user_name)
+        match = next((a for a, _ in existing if a.casefold() == name.casefold()), None)
         if match is None:
             raise AccountError(f"«{name}» nomli hisob topilmadi.")
         if len(existing) <= 1:
@@ -317,7 +372,7 @@ def delete_account(user_id: int, user_name: str, name: str) -> None:
                 ws.delete_rows(idx)
         except Exception as exc:  # noqa: BLE001
             raise SheetsError(str(exc)) from exc
-        _accounts_cache[user_id] = [a for a in existing if a.casefold() != match.casefold()]
+        _accounts_cache[user_id] = [(a, c) for a, c in existing if a.casefold() != match.casefold()]
 
 
 # --------------------------------------------------------------------------
@@ -359,17 +414,20 @@ def _rows_of(user_id: int, user_name: str, account: str | None = None):
 
 
 def _fmt(amount: float) -> str:
-    return f"{amount:,.0f}".replace(",", " ")
+    if abs(amount - round(amount)) < 0.005:
+        return f"{round(amount):,.0f}".replace(",", " ")
+    return f"{amount:,.2f}".replace(",", " ").replace(".", ",")
 
 
 def ensure_can_spend(user_id: int, user_name: str, account: str, amount: float) -> None:
     """Chiqim qoldiqdan oshsa AccountError ko'taradi — balans manfiyga tushmaydi."""
     current = get_balance(user_id, user_name, account)["balance"]
     if amount > current + 0.001:      # kasr xatoliklariga kichik yo'l qo'yiladi
+        cur = get_currency(user_id, user_name, account)
         raise AccountError(
             f"«{account}» hisobida buncha mablag' yo'q.\n"
-            f"Mavjud qoldiq: <b>{_fmt(current)} so'm</b>, "
-            f"siz esa {_fmt(amount)} so'm chiqim qilmoqchisiz."
+            f"Mavjud qoldiq: <b>{_fmt(current)} {cur}</b>, "
+            f"siz esa {_fmt(amount)} {cur} chiqim qilmoqchisiz."
         )
 
 
@@ -408,11 +466,12 @@ def get_balance(user_id: int, user_name: str, account: str) -> dict:
 
 
 def get_all_balances(user_id: int, user_name: str) -> dict:
-    """Barcha hisoblar bo'yicha balans: {hisob nomi: {income, expense, balance}}."""
-    accounts = get_accounts(user_id, user_name)
+    """Barcha hisoblar: {hisob nomi: {income, expense, balance, currency}}."""
+    accounts = get_accounts_full(user_id, user_name)
     _, rows = _rows_of(user_id, user_name, None)
-    result = {a: {"income": 0.0, "expense": 0.0, "balance": 0.0} for a in accounts}
-    by_fold = {a.casefold(): a for a in accounts}
+    result = {a: {"income": 0.0, "expense": 0.0, "balance": 0.0, "currency": c}
+              for a, c in accounts}
+    by_fold = {a.casefold(): a for a, _ in accounts}
     for _, row in rows:
         key = by_fold.get(row[COL_ACCOUNT].strip().casefold())
         if key is None:

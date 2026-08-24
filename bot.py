@@ -54,10 +54,11 @@ BTN_ADD_ACCOUNT = "➕ Yangi hisob"
 BTN_DEL_ACCOUNT = "🗑 Hisobni o'chirish"
 BTN_BACK = "⬅️ Orqaga"
 BTN_NO_NOTE = "➡️ Izohsiz saqlash"
+BTN_CURRENCY = "💱 Valyutani o'zgartirish"
 
 MENU_WORDS = {
     BTN_INCOME, BTN_EXPENSE, BTN_BALANCE, BTN_HISTORY, BTN_UNDO,
-    BTN_ACCOUNTS, BTN_CANCEL, BTN_ADD_ACCOUNT, BTN_DEL_ACCOUNT, BTN_BACK, BTN_NO_NOTE,
+    BTN_ACCOUNTS, BTN_CANCEL, BTN_ADD_ACCOUNT, BTN_DEL_ACCOUNT, BTN_BACK, BTN_NO_NOTE, BTN_CURRENCY,
 }
 
 SHEETS_ERROR_TEXT = "⚠️ Jadval bilan bog'lanib bo'lmadi. Biroz kutib, qayta urinib ko'ring."
@@ -83,8 +84,15 @@ note_menu = ReplyKeyboardMarkup(
 accounts_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ADD_ACCOUNT), KeyboardButton(text=BTN_DEL_ACCOUNT)],
+        [KeyboardButton(text=BTN_CURRENCY)],
         [KeyboardButton(text=BTN_BACK)],
     ],
+    resize_keyboard=True,
+)
+
+currency_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=c) for c in sheets.CURRENCIES],
+              [KeyboardButton(text=BTN_CANCEL)]],
     resize_keyboard=True,
 )
 
@@ -111,6 +119,9 @@ class Flow(StatesGroup):
     choose_account_undo = State()     # o'chirish uchun hisob tanlash
     enter_new_account = State()       # yangi hisob nomi
     choose_account_delete = State()   # o'chiriladigan hisobni tanlash
+    choose_new_currency = State()     # yangi hisob uchun valyuta
+    choose_account_cur = State()      # valyutasi o'zgartiriladigan hisob
+    choose_currency = State()         # yangi valyuta
 
 
 AMOUNT_RE = re.compile(r"^[\d\s.,']+$")
@@ -134,36 +145,45 @@ def parse_amount(text: str) -> float | None:
     return amount if amount > 0 else None
 
 
-def format_money(amount: float) -> str:
-    return f"{amount:,.0f}".replace(",", " ")
+def format_money(amount: float, currency: str = "") -> str:
+    """20000 -> '20 000 so'm'. Kasr qism bo'lsa ko'rsatiladi."""
+    if abs(amount - round(amount)) < 0.005:
+        s = f"{round(amount):,.0f}".replace(",", " ")
+    else:
+        s = f"{amount:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{s} {currency}".strip()
 
 
 def format_all_balances(balances: dict) -> str:
     if not balances:
         return "Hisoblar topilmadi."
     lines = ["💰 <b>Balans</b>"]
-    total = 0.0
+    totals: dict[str, float] = {}
     for account, b in balances.items():
-        total += b["balance"]
+        cur = b.get("currency", "")
+        totals[cur] = totals.get(cur, 0.0) + b["balance"]
         lines.append(
             f"\n<b>{account}</b>\n"
-            f"  ➕ Kirim: {format_money(b['income'])} so'm\n"
-            f"  ➖ Chiqim: {format_money(b['expense'])} so'm\n"
-            f"  <b>Qoldiq: {format_money(b['balance'])} so'm</b>"
+            f"  ➕ Kirim: {format_money(b['income'], cur)}\n"
+            f"  ➖ Chiqim: {format_money(b['expense'], cur)}\n"
+            f"  <b>Qoldiq: {format_money(b['balance'], cur)}</b>"
         )
+    # Umumiy qoldiq HAR BIR VALYUTA uchun alohida — ular hech qachon qo'shilmaydi
     if len(balances) > 1:
-        lines.append(f"\n—————————————\n<b>Umumiy qoldiq: {format_money(total)} so'm</b>")
+        lines.append("\n—————————————")
+        for cur, total in totals.items():
+            lines.append(f"<b>Umumiy qoldiq: {format_money(total, cur)}</b>")
     return "\n".join(lines)
 
 
-def format_history(account: str, records: list) -> str:
+def format_history(account: str, records: list, currency: str = "") -> str:
     if not records:
         return f"«{account}» hisobida hozircha yozuv yo'q."
     lines = [f"📜 <b>{account}</b> — oxirgi yozuvlar\n"]
     for r in records:
         sign = "➕" if r["type"] == "income" else "➖"
         note = f" — {r['note']}" if r["note"] else ""
-        lines.append(f"{sign} {format_money(r['amount'])} so'm{note}  <i>({r['created_at']})</i>")
+        lines.append(f"{sign} {format_money(r['amount'], currency)}{note}  <i>({r['created_at']})</i>")
     return "\n".join(lines)
 
 
@@ -211,7 +231,9 @@ async def cmd_help(message: Message) -> None:
         f"{BTN_BALANCE} — barcha hisoblar bo'yicha balans\n"
         f"{BTN_HISTORY} — tanlangan hisobning so'nggi yozuvlari\n"
         f"{BTN_UNDO} — oxirgi yozuvni bekor qilish\n"
-        f"{BTN_ACCOUNTS} — hisob qo'shish yoki o'chirish\n\n"
+        f"{BTN_ACCOUNTS} — hisob qo'shish, o'chirish, valyutasini o'zgartirish\n\n"
+        "Har bir hisobning o'z valyutasi bor (so'm yoki $) — ular hech qachon "
+        "bir-biriga qo'shilmaydi.\n\n"
         "Har bir yozuv qaysi hisobga tegishli ekani so'raladi — hisoblar "
         "bir-biriga aralashmaydi.\n\n"
         "❗️ Chiqim hisobdagi qoldiqdan oshmaydi — balans hech qachon manfiy bo'lmaydi.\n\n"
@@ -297,10 +319,13 @@ async def process_amount(message: Message, state: FSMContext) -> None:
             await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
             return
 
+    cur = await asyncio.to_thread(
+        sheets.get_currency, message.from_user.id, message.from_user.full_name, data["account"]
+    )
     await state.update_data(amount=amount)
     await state.set_state(Flow.enter_note)
     await message.answer(
-        f"Summa: <b>{format_money(amount)} so'm</b>\n\n"
+        f"Summa: <b>{format_money(amount, cur)}</b>\n\n"
         f"Endi izoh yozing (masalan: <code>transport</code>),\n"
         f"yoki «{BTN_NO_NOTE}» tugmasini bosing.",
         reply_markup=note_menu,
@@ -333,11 +358,14 @@ async def process_note(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
+    cur = await asyncio.to_thread(
+        sheets.get_currency, message.from_user.id, message.from_user.full_name, account
+    )
     label = "Kirim" if tx_type == "income" else "Chiqim"
     icon = "➕" if tx_type == "income" else "➖"
     note_text = f" ({note})" if note else ""
     await message.answer(
-        f"{icon} <b>{account}</b> — {label} qo'shildi: {format_money(amount)} so'm{note_text}",
+        f"{icon} <b>{account}</b> — {label} qo'shildi: {format_money(amount, cur)}{note_text}",
         reply_markup=main_menu,
     )
 
@@ -382,13 +410,16 @@ async def picked_account_history(message: Message, state: FSMContext) -> None:
         records = await asyncio.to_thread(
             sheets.get_history, message.from_user.id, message.from_user.full_name, chosen, 10
         )
+        cur = await asyncio.to_thread(
+            sheets.get_currency, message.from_user.id, message.from_user.full_name, chosen
+        )
     except sheets.SheetsError as exc:
         logger.warning(f"Tarixni o'qib bo'lmadi: {exc}")
         await state.clear()
         await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
         return
     await state.clear()
-    await message.answer(format_history(chosen, records), reply_markup=main_menu)
+    await message.answer(format_history(chosen, records, cur), reply_markup=main_menu)
 
 
 # --- Oxirgi yozuvni o'chirish ---
@@ -428,9 +459,12 @@ async def picked_account_undo(message: Message, state: FSMContext) -> None:
     if deleted is None:
         await message.answer(f"«{chosen}» hisobida o'chiriladigan yozuv yo'q.", reply_markup=main_menu)
         return
+    cur = await asyncio.to_thread(
+        sheets.get_currency, message.from_user.id, message.from_user.full_name, chosen
+    )
     label = "Kirim" if deleted["type"] == "income" else "Chiqim"
     await message.answer(
-        f"O'chirildi: <b>{chosen}</b> — {label} {format_money(deleted['amount'])} so'm",
+        f"O'chirildi: <b>{chosen}</b> — {label} {format_money(deleted['amount'], cur)}",
         reply_markup=main_menu,
     )
 
@@ -440,12 +474,14 @@ async def picked_account_undo(message: Message, state: FSMContext) -> None:
 @dp.message(StateFilter(None), F.text == BTN_ACCOUNTS)
 async def show_accounts(message: Message) -> None:
     try:
-        accounts = await load_accounts(message)
+        full = await asyncio.to_thread(
+            sheets.get_accounts_full, message.from_user.id, message.from_user.full_name
+        )
     except sheets.SheetsError as exc:
         logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
         await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
         return
-    listed = "\n".join(f"• {a}" for a in accounts)
+    listed = "\n".join(f"• {a} — <i>{c}</i>" for a, c in full)
     await message.answer(f"⚙️ <b>Hisoblaringiz</b>\n\n{listed}", reply_markup=accounts_menu)
 
 
@@ -470,12 +506,33 @@ async def process_new_account(message: Message, state: FSMContext) -> None:
     if name in MENU_WORDS:
         await message.answer("Bu nom menyu tugmasi bilan bir xil. Boshqa nom tanlang.")
         return
+    if not name:
+        await message.answer("Hisob nomini yozing.")
+        return
+
+    await state.update_data(new_account=name)
+    await state.set_state(Flow.choose_new_currency)
+    await message.answer(
+        f"«{name}» hisobi qaysi valyutada yuritiladi?", reply_markup=currency_menu
+    )
+
+
+@dp.message(Flow.choose_new_currency)
+async def process_new_currency(message: Message, state: FSMContext) -> None:
+    currency = (message.text or "").strip()
+    if currency not in sheets.CURRENCIES:
+        await message.answer("Valyutani tugmalardan tanlang.", reply_markup=currency_menu)
+        return
+
+    data = await state.get_data()
     try:
         created = await asyncio.to_thread(
-            sheets.add_account, message.from_user.id, message.from_user.full_name, name
+            sheets.add_account, message.from_user.id, message.from_user.full_name,
+            data["new_account"], currency,
         )
     except sheets.AccountError as exc:
-        await message.answer(f"⚠️ {exc}")
+        await state.set_state(Flow.enter_new_account)
+        await message.answer(f"⚠️ {exc}\n\nBoshqa nom yozing.", reply_markup=cancel_menu)
         return
     except sheets.SheetsError as exc:
         logger.warning(f"Hisob qo'shib bo'lmadi: {exc}")
@@ -484,7 +541,72 @@ async def process_new_account(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer(f"✅ «{created}» hisobi qo'shildi.", reply_markup=main_menu)
+    await message.answer(
+        f"✅ «{created}» hisobi qo'shildi ({currency}).", reply_markup=main_menu
+    )
+
+
+# --- Valyutani o'zgartirish ---
+
+@dp.message(F.text == BTN_CURRENCY)
+async def start_change_currency(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    await state.set_state(Flow.choose_account_cur)
+    await message.answer("Qaysi hisobning valyutasi o'zgarsin?",
+                         reply_markup=account_keyboard(accounts))
+
+
+@dp.message(Flow.choose_account_cur)
+async def picked_account_for_currency(message: Message, state: FSMContext) -> None:
+    try:
+        accounts = await load_accounts(message)
+    except sheets.SheetsError as exc:
+        logger.warning(f"Hisoblarni o'qib bo'lmadi: {exc}")
+        await state.clear()
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+    chosen = next((a for a in accounts if a == (message.text or "")), None)
+    if chosen is None:
+        await message.answer("Iltimos, tugmalardan tanlang.",
+                             reply_markup=account_keyboard(accounts))
+        return
+    await state.update_data(cur_account=chosen)
+    await state.set_state(Flow.choose_currency)
+    await message.answer(f"«{chosen}» qaysi valyutada yuritilsin?", reply_markup=currency_menu)
+
+
+@dp.message(Flow.choose_currency)
+async def process_change_currency(message: Message, state: FSMContext) -> None:
+    currency = (message.text or "").strip()
+    if currency not in sheets.CURRENCIES:
+        await message.answer("Valyutani tugmalardan tanlang.", reply_markup=currency_menu)
+        return
+    data = await state.get_data()
+    account = data["cur_account"]
+    try:
+        await asyncio.to_thread(
+            sheets.set_account_currency, message.from_user.id,
+            message.from_user.full_name, account, currency,
+        )
+    except sheets.AccountError as exc:
+        await state.clear()
+        await message.answer(f"⚠️ {exc}", reply_markup=main_menu)
+        return
+    except sheets.SheetsError as exc:
+        logger.warning(f"Valyutani o'zgartirib bo'lmadi: {exc}")
+        await state.clear()
+        await message.answer(SHEETS_ERROR_TEXT, reply_markup=main_menu)
+        return
+
+    await state.clear()
+    await message.answer(
+        f"💱 «{account}» endi <b>{currency}</b> da yuritiladi.", reply_markup=main_menu
+    )
 
 
 @dp.message(F.text == BTN_DEL_ACCOUNT)
