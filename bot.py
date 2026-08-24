@@ -1,5 +1,5 @@
 """
-Kirim-chiqim hisobini yurituvchi Telegram bot.
+"Mening hamyonim" — kirim-chiqim hisobini yurituvchi Telegram bot.
 
 - Har bir foydalanuvchi uchun Google jadvalda ALOHIDA list ochiladi (ismi bilan).
 - Har bir foydalanuvchi bir nechta hisob yuritishi mumkin (masalan "Imzo showroom"
@@ -185,9 +185,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
     await message.answer(
         "Assalomu alaykum! 👋\n\n"
-        "Men — shaxsiy kassa botiman. Olgan va bergan pullaringizni hisob-kitob qilib beraman.\n\n"
+        "Men — <b>Mening hamyonim</b>. Olgan va bergan pullaringizni hisob-kitob qilib beraman.\n\n"
         f"Sizning hisoblaringiz: <b>{'</b>, <b>'.join(accounts)}</b>\n"
-        "Ularni ⚙️ Hisoblarim bo'limida o'zgartirishingiz mumkin.",
+        "Yangi hisob qo'shish uchun ⚙️ Hisoblarim bo'limiga kiring.",
         reply_markup=main_menu,
     )
 
@@ -204,6 +204,7 @@ async def cmd_help(message: Message) -> None:
         f"{BTN_ACCOUNTS} — hisob qo'shish yoki o'chirish\n\n"
         "Har bir yozuv qaysi hisobga tegishli ekani so'raladi — hisoblar "
         "bir-biriga aralashmaydi.\n\n"
+        "❗️ Chiqim hisobdagi qoldiqdan oshmaydi — balans hech qachon manfiy bo'lmaydi.\n\n"
         "Summani izoh bilan birga yozish mumkin:\n<code>50000 oylik maosh</code>",
         reply_markup=main_menu,
     )
@@ -276,6 +277,10 @@ async def process_amount(message: Message, state: FSMContext) -> None:
             message.from_user.id, message.from_user.full_name,
             account, tx_type, amount, note,
         )
+    except sheets.AccountError as exc:
+        # Masalan: chiqim qoldiqdan oshib ketdi — holatni saqlaymiz, qayta urinsin
+        await message.answer(f"⚠️ {exc}\n\nBoshqa summa kiriting yoki bekor qiling.")
+        return
     except sheets.SheetsError as exc:
         logger.warning(f"Jadvalga yozib bo'lmadi: {exc}")
         await state.clear()

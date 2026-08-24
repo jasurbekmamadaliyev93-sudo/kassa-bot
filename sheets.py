@@ -27,7 +27,8 @@ USERS_HEADERS = ["User ID", "Ism", "List nomi"]
 ACCOUNTS_SHEET = "_Hisoblar"
 ACCOUNTS_HEADERS = ["User ID", "Hisob"]
 
-DEFAULT_ACCOUNTS = ["Imzo showroom", "Shaxsiy"]
+DEFAULT_ACCOUNTS = ["Shaxsiy"]   # yangi foydalanuvchida faqat shu ochiladi,
+                                 # qolganini o'zi qo'shadi
 
 LABEL_INCOME = "Kirim"
 LABEL_EXPENSE = "Chiqim"
@@ -344,12 +345,28 @@ def _rows_of(user_id: int, user_name: str, account: str | None = None):
     return ws, result
 
 
+def _fmt(amount: float) -> str:
+    return f"{amount:,.0f}".replace(",", " ")
+
+
 def add_transaction(user_id: int, user_name: str, account: str,
                     tx_type: str, amount: float, note: str = "") -> None:
+    """Yangi yozuv qo'shadi.
+    Chiqim hisobdagi qoldiqdan oshsa, AccountError ko'tariladi — balans hech qachon
+    manfiyga (qarzga) tushmaydi."""
     if tx_type not in ("income", "expense"):
         raise ValueError("tx_type 'income' yoki 'expense' bo'lishi kerak")
     if amount <= 0:
         raise ValueError("Summa musbat son bo'lishi kerak")
+
+    if tx_type == "expense":
+        current = get_balance(user_id, user_name, account)["balance"]
+        if amount > current + 0.001:     # kasr xatoliklariga kichik yo'l qo'yiladi
+            raise AccountError(
+                f"«{account}» hisobida buncha mablag' yo'q.\n"
+                f"Mavjud qoldiq: <b>{_fmt(current)} so'm</b>, "
+                f"siz esa {_fmt(amount)} so'm chiqim qilmoqchisiz."
+            )
 
     ws = get_user_sheet(user_id, user_name)
     label = LABEL_INCOME if tx_type == "income" else LABEL_EXPENSE
